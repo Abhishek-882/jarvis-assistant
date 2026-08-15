@@ -56,6 +56,7 @@ fun HomeScreen(
         JarvisServiceState.LISTENING -> JarvisState.LISTENING
         JarvisServiceState.THINKING -> JarvisState.THINKING
         JarvisServiceState.SPEAKING -> JarvisState.SPEAKING
+        JarvisServiceState.DOWNLOADING -> JarvisState.THINKING  // reuse pulsing animation
         JarvisServiceState.ERROR -> JarvisState.ERROR
     }
 

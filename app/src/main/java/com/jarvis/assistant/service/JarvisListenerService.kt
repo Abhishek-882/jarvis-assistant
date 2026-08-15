@@ -122,8 +122,8 @@ class JarvisListenerService : Service() {
 
         createNotificationChannel()
 
-        // Request battery optimization exemption (keeps JARVIS alive in Doze)
-        requestBatteryOptimizationExemption()
+        // NOTE: Battery optimization request is now triggered after model loads
+        // to avoid disrupting the initial permission flow
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -245,12 +245,31 @@ class JarvisListenerService : Service() {
      * Start the complete voice pipeline.
      */
     private suspend fun startVoicePipeline() {
-        // Initialize Vosk model
+        // Request battery optimization exemption here (after service is fully started)
+        withContext(Dispatchers.Main) {
+            requestBatteryOptimizationExemption()
+        }
+
+        // Check if model needs downloading (first launch)
+        val modelDir = java.io.File(filesDir, "vosk-model")
+        val needsDownload = !modelDir.exists() || (modelDir.list()?.isEmpty() == true)
+
+        if (needsDownload) {
+            _serviceState.value = JarvisServiceState.DOWNLOADING
+            updateNotification("JARVIS is downloading voice model (first launch)...")
+            withContext(Dispatchers.Main) {
+                ttsManager.speak("Welcome, Sir. Downloading my voice recognition model. This will only happen once and takes about a minute.")
+            }
+        }
+
+        // Initialize Vosk model (downloads if needed)
         val modelLoaded = speechRecognizer.initialize()
         if (!modelLoaded) {
             Log.e(TAG, "Failed to load Vosk model — running without speech recognition")
             _serviceState.value = JarvisServiceState.ERROR
-            ttsManager.speak("I apologize, ${com.jarvis.assistant.ai.JarvisPersonality.userHonorific}. The speech model could not be loaded. Please check the app configuration.")
+            withContext(Dispatchers.Main) {
+                ttsManager.speak("I apologize, Sir. The speech model could not be loaded. Please check your internet connection and restart.")
+            }
             return
         }
 
@@ -267,6 +286,13 @@ class JarvisListenerService : Service() {
 
         _serviceState.value = JarvisServiceState.IDLE
         updateNotification("JARVIS is standing by...")
+
+        // Greet on first successful start
+        if (needsDownload) {
+            withContext(Dispatchers.Main) {
+                ttsManager.speak("Voice model loaded. I'm ready, Sir. Say Jarvis to activate me.")
+            }
+        }
 
         // Start audio capture and feed into the pipeline
         audioCapture.startCapture(serviceScope) { buffer, size ->
@@ -553,5 +579,6 @@ enum class JarvisServiceState {
     LISTENING,
     THINKING,
     SPEAKING,
+    DOWNLOADING,
     ERROR
 }
