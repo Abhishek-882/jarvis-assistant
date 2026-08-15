@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -37,16 +38,22 @@ import com.jarvis.assistant.ui.theme.JarvisTheme
  */
 class MainActivity : ComponentActivity() {
 
+    companion object {
+        private const val TAG = "JarvisMain"
+    }
+
     private lateinit var settings: SettingsRepository
 
     // Permission launcher
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
-        val allGranted = permissions.all { it.value }
-        if (allGranted) {
+        val micGranted = permissions[Manifest.permission.RECORD_AUDIO] ?: false
+        if (micGranted) {
+            Log.i(TAG, "Microphone permission granted — starting service")
             startJarvisService()
         } else {
+            Log.w(TAG, "Microphone permission denied")
             Toast.makeText(this, "JARVIS needs microphone permission to function", Toast.LENGTH_LONG).show()
         }
     }
@@ -75,49 +82,54 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+
+        // Auto-start service if mic permission is already granted
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            == PackageManager.PERMISSION_GRANTED) {
+            Log.i(TAG, "Mic permission already granted, auto-starting service")
+            startJarvisService()
+        }
     }
 
     /**
      * Request all necessary permissions before starting the service.
      */
     private fun requestPermissionsAndStart() {
-        val requiredPermissions = mutableListOf(
+        // Check mic permission first — this is the only REQUIRED one
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            == PackageManager.PERMISSION_GRANTED) {
+            startJarvisService()
+            return
+        }
+
+        // Request permissions — only include what's needed
+        val permissions = mutableListOf(
             Manifest.permission.RECORD_AUDIO
         )
 
         // Android 13+ requires POST_NOTIFICATIONS
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            requiredPermissions.add(Manifest.permission.POST_NOTIFICATIONS)
+            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
         }
 
-        // Optional permissions
-        val optionalPermissions = listOf(
-            Manifest.permission.CALL_PHONE,
-            Manifest.permission.SEND_SMS,
-            Manifest.permission.READ_CONTACTS
-        )
-
-        val allPermissions = requiredPermissions + optionalPermissions
-        val notGranted = allPermissions.filter {
-            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
-        }
-
-        if (notGranted.isEmpty()) {
-            startJarvisService()
-        } else {
-            permissionLauncher.launch(notGranted.toTypedArray())
-        }
+        permissionLauncher.launch(permissions.toTypedArray())
     }
 
     /**
      * Start the JARVIS foreground listener service.
      */
     private fun startJarvisService() {
-        val intent = Intent(this, JarvisListenerService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
+        try {
+            val intent = Intent(this, JarvisListenerService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+            Log.i(TAG, "JARVIS service started")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start JARVIS service", e)
+            Toast.makeText(this, "Failed to start JARVIS: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -125,8 +137,12 @@ class MainActivity : ComponentActivity() {
      * Stop the JARVIS listener service.
      */
     private fun stopJarvisService() {
-        val intent = Intent(this, JarvisListenerService::class.java)
-        stopService(intent)
+        try {
+            val intent = Intent(this, JarvisListenerService::class.java)
+            stopService(intent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to stop JARVIS service", e)
+        }
     }
 
     override fun onDestroy() {

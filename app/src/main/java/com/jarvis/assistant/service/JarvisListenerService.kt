@@ -68,13 +68,13 @@ class JarvisListenerService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-    // Components
-    private lateinit var audioCapture: AudioCaptureManager
-    private lateinit var speechRecognizer: SpeechRecognizerManager
-    private lateinit var ttsManager: TextToSpeechManager
-    private lateinit var speakerVerifier: SpeakerVerifier
-    private lateinit var conversationManager: ConversationManager
-    private lateinit var commandExecutor: CommandExecutor
+    // Components — initialized lazily to avoid crashes in onCreate
+    private var audioCapture: AudioCaptureManager? = null
+    private var speechRecognizer: SpeechRecognizerManager? = null
+    private var ttsManager: TextToSpeechManager? = null
+    private var speakerVerifier: SpeakerVerifier? = null
+    private var conversationManager: ConversationManager? = null
+    private var commandExecutor: CommandExecutor? = null
     private var geminiClient: GeminiClient? = null
 
     // WakeLock to keep CPU alive when screen is off
@@ -90,56 +90,45 @@ class JarvisListenerService : Service() {
         super.onCreate()
         Log.i(TAG, "JARVIS Service created")
 
-        // Acquire WakeLock — keeps CPU running even when screen is off
-        acquireWakeLock()
-
-        // Initialize components
-        audioCapture = AudioCaptureManager(this)
-        speechRecognizer = SpeechRecognizerManager(this)
-        ttsManager = TextToSpeechManager(this)
-        speakerVerifier = SpeakerVerifier()
-        conversationManager = ConversationManager()
-        commandExecutor = CommandExecutor(this)
-
-        // Initialize TTS
-        ttsManager.initialize {
-            Log.i(TAG, "TTS ready")
-        }
-
-        // Load API key and create Gemini client using SettingsRepository
-        val settings = SettingsRepository(this)
-        val apiKey = settings.apiKey
-        if (apiKey.isNotBlank()) {
-            geminiClient = GeminiClient(apiKey)
-            Log.i(TAG, "Gemini client initialized with API key")
-        } else {
-            Log.w(TAG, "No Gemini API key — running in offline mode")
-        }
-
-        // Restore voice profile
-        val voiceProfile = settings.voiceProfile
-        voiceProfile?.let { speakerVerifier.restoreProfile(it) }
-
+        // Create notification channel FIRST (required before startForeground)
         createNotificationChannel()
-
-        // NOTE: Battery optimization request is now triggered after model loads
-        // to avoid disrupting the initial permission flow
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.i(TAG, "JARVIS Service starting")
+        Log.i(TAG, "JARVIS Service onStartCommand")
 
-        // Start as foreground service
-        val notification = createNotification("JARVIS is listening...")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        // Handle stop action from notification
+        if (intent?.action == "STOP_JARVIS") {
+            Log.i(TAG, "Stop action received from notification")
+            stopSelf()
+            return START_NOT_STICKY
         }
 
-        // Initialize and start the voice pipeline
+        // Start as foreground service IMMEDIATELY (must be within 5 seconds)
+        try {
+            val notification = createNotification("JARVIS is starting...")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+            Log.i(TAG, "Foreground service started successfully")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start foreground service", e)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        // Now initialize components safely in background
         serviceScope.launch {
-            startVoicePipeline()
+            try {
+                initializeComponents()
+                startVoicePipeline()
+            } catch (e: Exception) {
+                Log.e(TAG, "Fatal error in voice pipeline", e)
+                _serviceState.value = JarvisServiceState.ERROR
+                updateNotification("JARVIS encountered an error")
+            }
         }
 
         _isRunning.value = true
@@ -149,65 +138,112 @@ class JarvisListenerService : Service() {
     }
 
     /**
+     * Initialize all components safely with error handling.
+     * Runs on background thread.
+     */
+    private suspend fun initializeComponents() {
+        withContext(Dispatchers.IO) {
+            Log.i(TAG, "Initializing JARVIS components...")
+
+            try {
+                audioCapture = AudioCaptureManager(this@JarvisListenerService)
+                speechRecognizer = SpeechRecognizerManager(this@JarvisListenerService)
+                speakerVerifier = SpeakerVerifier()
+                conversationManager = ConversationManager()
+                commandExecutor = CommandExecutor(this@JarvisListenerService)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error initializing components", e)
+            }
+
+            // Initialize TTS on main thread (TTS requires it)
+            withContext(Dispatchers.Main) {
+                try {
+                    ttsManager = TextToSpeechManager(this@JarvisListenerService)
+                    ttsManager?.initialize {
+                        Log.i(TAG, "TTS ready")
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error initializing TTS", e)
+                }
+            }
+
+            // Load API key and create Gemini client
+            try {
+                val settings = SettingsRepository(this@JarvisListenerService)
+                val apiKey = settings.apiKey
+                if (apiKey.isNotBlank()) {
+                    geminiClient = GeminiClient(apiKey)
+                    Log.i(TAG, "Gemini client initialized")
+                } else {
+                    Log.w(TAG, "No Gemini API key — running in offline mode")
+                }
+
+                // Restore voice profile
+                val voiceProfile = settings.voiceProfile
+                voiceProfile?.let { speakerVerifier?.restoreProfile(it) }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error loading settings", e)
+            }
+
+            Log.i(TAG, "All components initialized")
+        }
+    }
+
+    /**
      * Acquire a partial WakeLock to keep the CPU running when the screen is off.
-     *
-     * This is CRITICAL for always-listening functionality:
-     * - Without it, Android will put the CPU to sleep after screen off
-     * - AudioRecord stops receiving data when CPU sleeps
-     * - PARTIAL_WAKE_LOCK keeps only the CPU awake (not the screen)
-     * - Battery impact: ~3-5% per hour (acceptable for an always-on assistant)
      */
     private fun acquireWakeLock() {
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            WAKELOCK_TAG
-        ).apply {
-            // Acquire indefinitely (released in onDestroy)
-            acquire()
+        try {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                WAKELOCK_TAG
+            ).apply {
+                acquire()
+            }
+            Log.i(TAG, "WakeLock acquired — CPU will stay awake")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to acquire WakeLock", e)
         }
-        Log.i(TAG, "WakeLock acquired — CPU will stay awake")
     }
 
     /**
      * Release the WakeLock when the service is destroyed.
      */
     private fun releaseWakeLock() {
-        wakeLock?.let {
-            if (it.isHeld) {
-                it.release()
-                Log.i(TAG, "WakeLock released")
+        try {
+            wakeLock?.let {
+                if (it.isHeld) {
+                    it.release()
+                    Log.i(TAG, "WakeLock released")
+                }
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error releasing WakeLock", e)
         }
         wakeLock = null
     }
 
     /**
      * Request battery optimization exemption from the user.
-     *
-     * This prevents Android's Doze mode from:
-     * - Deferring the service's alarms and network access
-     * - Suspending the service during inactivity
-     *
-     * The user sees a system dialog asking to exempt JARVIS from battery optimization.
      */
     private fun requestBatteryOptimizationExemption() {
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        val packageName = packageName
+        try {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            val packageName = packageName
 
-        if (!powerManager.isIgnoringBatteryOptimizations(packageName)) {
-            try {
+            if (!powerManager.isIgnoringBatteryOptimizations(packageName)) {
                 val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
                     data = Uri.parse("package:$packageName")
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
                 startActivity(intent)
                 Log.i(TAG, "Requested battery optimization exemption")
-            } catch (e: Exception) {
-                Log.w(TAG, "Could not request battery exemption: ${e.message}")
+            } else {
+                Log.i(TAG, "Already exempt from battery optimization ✓")
             }
-        } else {
-            Log.i(TAG, "Already exempt from battery optimization ✓")
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not request battery exemption: ${e.message}")
         }
     }
 
@@ -223,58 +259,76 @@ class JarvisListenerService : Service() {
 
     /**
      * Schedule the service to restart after a short delay using AlarmManager.
-     * This is a safety net in case the system kills the service.
      */
     private fun scheduleServiceRestart() {
-        val restartIntent = Intent(this, JarvisListenerService::class.java)
-        val pendingIntent = PendingIntent.getService(
-            this, 1, restartIntent,
-            PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
-        )
+        try {
+            val restartIntent = Intent(this, JarvisListenerService::class.java)
+            val pendingIntent = PendingIntent.getService(
+                this, 1, restartIntent,
+                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+            )
 
-        val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        alarmManager.setExactAndAllowWhileIdle(
-            AlarmManager.RTC_WAKEUP,
-            System.currentTimeMillis() + 3000, // Restart after 3 seconds
-            pendingIntent
-        )
-        Log.i(TAG, "Service restart scheduled in 3 seconds")
+            val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            alarmManager.setExactAndAllowWhileIdle(
+                AlarmManager.RTC_WAKEUP,
+                System.currentTimeMillis() + 3000, // Restart after 3 seconds
+                pendingIntent
+            )
+            Log.i(TAG, "Service restart scheduled in 3 seconds")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to schedule restart", e)
+        }
     }
 
     /**
      * Start the complete voice pipeline.
      */
     private suspend fun startVoicePipeline() {
-        // Request battery optimization exemption here (after service is fully started)
+        Log.i(TAG, "Starting voice pipeline...")
+
+        // Acquire WakeLock for background operation
         withContext(Dispatchers.Main) {
-            requestBatteryOptimizationExemption()
+            acquireWakeLock()
         }
 
         // Check if model needs downloading (first launch)
         val modelDir = java.io.File(filesDir, "vosk-model")
-        val needsDownload = !modelDir.exists() || (modelDir.list()?.isEmpty() == true)
+        val needsDownload = !modelDir.exists() || (modelDir.list()?.isEmpty() != false)
 
         if (needsDownload) {
             _serviceState.value = JarvisServiceState.DOWNLOADING
             updateNotification("JARVIS is downloading voice model (first launch)...")
+            // Give TTS a moment to initialize
+            delay(2000)
             withContext(Dispatchers.Main) {
-                ttsManager.speak("Welcome, Sir. Downloading my voice recognition model. This will only happen once and takes about a minute.")
+                ttsManager?.speak("Welcome, Sir. Downloading my voice recognition model. This will only happen once and takes about a minute.")
             }
         }
 
         // Initialize Vosk model (downloads if needed)
-        val modelLoaded = speechRecognizer.initialize()
-        if (!modelLoaded) {
-            Log.e(TAG, "Failed to load Vosk model — running without speech recognition")
+        val recognizer = speechRecognizer
+        if (recognizer == null) {
+            Log.e(TAG, "Speech recognizer not initialized")
             _serviceState.value = JarvisServiceState.ERROR
+            updateNotification("JARVIS speech error")
+            return
+        }
+
+        val modelLoaded = recognizer.initialize()
+        if (!modelLoaded) {
+            Log.e(TAG, "Failed to load Vosk model")
+            _serviceState.value = JarvisServiceState.ERROR
+            updateNotification("JARVIS: Voice model failed to load")
             withContext(Dispatchers.Main) {
-                ttsManager.speak("I apologize, Sir. The speech model could not be loaded. Please check your internet connection and restart.")
+                ttsManager?.speak("I apologize, Sir. The speech model could not be loaded. Please check your internet connection and restart.")
             }
             return
         }
 
+        Log.i(TAG, "Vosk model loaded successfully!")
+
         // Create wake word recognizer
-        val wakeWordRecognizer = speechRecognizer.createWakeWordRecognizer()
+        val wakeWordRecognizer = recognizer.createWakeWordRecognizer()
         if (wakeWordRecognizer == null) {
             Log.e(TAG, "Failed to create wake word recognizer")
             _serviceState.value = JarvisServiceState.ERROR
@@ -282,36 +336,60 @@ class JarvisListenerService : Service() {
         }
 
         // Create command recognizer
-        speechRecognizer.createCommandRecognizer()
+        recognizer.createCommandRecognizer()
 
         _serviceState.value = JarvisServiceState.IDLE
         updateNotification("JARVIS is standing by...")
 
         // Greet on first successful start
         if (needsDownload) {
+            delay(500)
             withContext(Dispatchers.Main) {
-                ttsManager.speak("Voice model loaded. I'm ready, Sir. Say Jarvis to activate me.")
+                ttsManager?.speak("Voice model loaded. I'm ready, Sir. Say Jarvis to activate me.")
             }
         }
 
+        // Request battery optimization exemption AFTER everything is running
+        withContext(Dispatchers.Main) {
+            requestBatteryOptimizationExemption()
+        }
+
         // Start audio capture and feed into the pipeline
-        audioCapture.startCapture(serviceScope) { buffer, size ->
+        val capture = audioCapture
+        if (capture == null) {
+            Log.e(TAG, "Audio capture not initialized")
+            _serviceState.value = JarvisServiceState.ERROR
+            return
+        }
+
+        val captureStarted = capture.startCapture(serviceScope) { buffer, size ->
             processAudio(buffer, size)
         }
 
-        Log.i(TAG, "Voice pipeline started — listening for wake word (screen on/off)")
+        if (captureStarted) {
+            Log.i(TAG, "Voice pipeline started — listening for wake word")
+        } else {
+            Log.e(TAG, "Failed to start audio capture")
+            _serviceState.value = JarvisServiceState.ERROR
+            updateNotification("JARVIS: Microphone unavailable")
+            withContext(Dispatchers.Main) {
+                ttsManager?.speak("I cannot access the microphone, Sir. Please check the app permissions.")
+            }
+        }
     }
 
     /**
      * Process incoming audio data through the pipeline.
      */
     private fun processAudio(buffer: ByteArray, size: Int) {
-        if (isListeningForCommand) {
-            // We're in command mode — process full speech
-            processCommandAudio(buffer, size)
-        } else {
-            // We're in wake word mode — listen for "Jarvis"
-            processWakeWordAudio(buffer, size)
+        try {
+            if (isListeningForCommand) {
+                processCommandAudio(buffer, size)
+            } else {
+                processWakeWordAudio(buffer, size)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error processing audio", e)
         }
     }
 
@@ -319,21 +397,23 @@ class JarvisListenerService : Service() {
      * Listen for the wake word "Jarvis".
      */
     private fun processWakeWordAudio(buffer: ByteArray, size: Int) {
-        val result = speechRecognizer.processWakeWord(buffer, size)
+        val recognizer = speechRecognizer ?: return
+        val result = recognizer.processWakeWord(buffer, size)
 
         if (result.detected) {
             Log.i(TAG, "🎯 Wake word detected! Confidence: ${result.confidence}")
 
             // Verify speaker identity
-            val audioShorts = audioCapture.convertToShortArray(buffer, size)
-            val (isMatch, similarity) = speakerVerifier.verifyVoice(audioShorts)
+            val capture = audioCapture ?: return
+            val audioShorts = capture.convertToShortArray(buffer, size)
+            val verifier = speakerVerifier
+            val (isMatch, similarity) = verifier?.verifyVoice(audioShorts) ?: Pair(true, 1.0f)
 
             if (isMatch) {
                 Log.i(TAG, "✅ Speaker verified (similarity: $similarity)")
                 onWakeWordActivated()
             } else {
                 Log.w(TAG, "❌ Speaker rejected (similarity: $similarity)")
-                // Don't respond — just keep listening
             }
         }
     }
@@ -350,17 +430,18 @@ class JarvisListenerService : Service() {
         updateNotification("JARVIS is listening to you...")
 
         // Reset the command recognizer for a fresh utterance
-        speechRecognizer.resetCommandRecognizer()
+        speechRecognizer?.resetCommandRecognizer()
 
         // Play a subtle acknowledgment
-        ttsManager.speak("Yes, ${com.jarvis.assistant.ai.JarvisPersonality.userHonorific}?")
+        ttsManager?.speak("Yes, Sir?")
     }
 
     /**
      * Process audio for command recognition (after wake word detected).
      */
     private fun processCommandAudio(buffer: ByteArray, size: Int) {
-        val result = speechRecognizer.processCommand(buffer, size)
+        val recognizer = speechRecognizer ?: return
+        val result = recognizer.processCommand(buffer, size)
 
         if (result.text.isNotBlank()) {
             _lastTranscription.value = result.text
@@ -371,8 +452,7 @@ class JarvisListenerService : Service() {
 
         // Check if the user has stopped speaking (silence detected)
         if (silenceCounter >= SILENCE_THRESHOLD && _lastTranscription.value.isNotBlank()) {
-            // Get the final transcription
-            val finalText = speechRecognizer.getFinalCommandResult().ifBlank {
+            val finalText = recognizer.getFinalCommandResult().ifBlank {
                 _lastTranscription.value
             }
 
@@ -410,8 +490,7 @@ class JarvisListenerService : Service() {
                 val offlineAction = CommandParser.parseOfflineCommand(command)
 
                 if (offlineAction != null && geminiClient == null) {
-                    // Execute offline action directly
-                    val response = "Right away, ${com.jarvis.assistant.ai.JarvisPersonality.userHonorific}."
+                    val response = "Right away, Sir."
                     respondAndExecute(response, offlineAction)
                     return@launch
                 }
@@ -419,40 +498,38 @@ class JarvisListenerService : Service() {
                 // Use Gemini AI for intelligent response
                 val client = geminiClient
                 if (client != null) {
-                    conversationManager.addUserMessage(command)
+                    conversationManager?.addUserMessage(command)
 
-                    val result = client.chat(command, conversationManager.history)
+                    val result = client.chat(command, conversationManager?.history ?: emptyList())
 
                     result.fold(
                         onSuccess = { response ->
                             val parsed = CommandParser.parse(response)
-                            conversationManager.addAssistantMessage(parsed.spokenText)
+                            conversationManager?.addAssistantMessage(parsed.spokenText)
                             respondAndExecute(parsed.spokenText, parsed.action)
                         },
                         onFailure = { error ->
-                            // Fallback to offline
                             val offlineFallback = CommandParser.parseOfflineCommand(command)
                             if (offlineFallback != null) {
-                                val response = "I'm having trouble connecting, but I can handle that locally, ${com.jarvis.assistant.ai.JarvisPersonality.userHonorific}."
+                                val response = "I'm having trouble connecting, but I can handle that locally, Sir."
                                 respondAndExecute(response, offlineFallback)
                             } else {
-                                val errorResponse = "I apologize, ${com.jarvis.assistant.ai.JarvisPersonality.userHonorific}. I'm unable to process that request at the moment. ${error.message ?: ""}"
+                                val errorResponse = "I apologize, Sir. I'm unable to process that request at the moment."
                                 respondWithSpeech(errorResponse)
                             }
                         }
                     )
                 } else {
-                    // No API key configured — offline only
                     if (offlineAction != null) {
-                        val response = "Executing, ${com.jarvis.assistant.ai.JarvisPersonality.userHonorific}."
+                        val response = "Executing, Sir."
                         respondAndExecute(response, offlineAction)
                     } else {
-                        respondWithSpeech("I need an API key to answer that, ${com.jarvis.assistant.ai.JarvisPersonality.userHonorific}. Please configure one in the settings.")
+                        respondWithSpeech("I need an API key to answer that, Sir. Please configure one in the settings.")
                     }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error processing command", e)
-                respondWithSpeech("I encountered an error, ${com.jarvis.assistant.ai.JarvisPersonality.userHonorific}. Please try again.")
+                respondWithSpeech("I encountered an error, Sir. Please try again.")
             }
         }
     }
@@ -466,11 +543,15 @@ class JarvisListenerService : Service() {
         _lastResponse.value = speechText
         onMessageReceived?.invoke(speechText, false)
 
-        ttsManager.speakAndWait(speechText)
+        ttsManager?.speakAndWait(speechText)
 
         // Execute the action after speaking
         action?.let {
-            commandExecutor.execute(it)
+            try {
+                commandExecutor?.execute(it)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error executing command", e)
+            }
         }
 
         // Return to idle
@@ -487,7 +568,7 @@ class JarvisListenerService : Service() {
         _lastResponse.value = text
         onMessageReceived?.invoke(text, false)
 
-        ttsManager.speakAndWait(text)
+        ttsManager?.speakAndWait(text)
 
         _serviceState.value = JarvisServiceState.IDLE
         updateNotification("JARVIS is standing by...")
@@ -550,9 +631,13 @@ class JarvisListenerService : Service() {
      * Update the notification text.
      */
     private fun updateNotification(text: String) {
-        val notification = createNotification(text)
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(NOTIFICATION_ID, notification)
+        try {
+            val notification = createNotification(text)
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.notify(NOTIFICATION_ID, notification)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to update notification", e)
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -563,9 +648,13 @@ class JarvisListenerService : Service() {
         _isRunning.value = false
         _serviceState.value = JarvisServiceState.IDLE
 
-        audioCapture.stopCapture()
-        speechRecognizer.shutdown()
-        ttsManager.shutdown()
+        try {
+            audioCapture?.stopCapture()
+            speechRecognizer?.shutdown()
+            ttsManager?.shutdown()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during cleanup", e)
+        }
         releaseWakeLock()
         serviceScope.cancel()
     }

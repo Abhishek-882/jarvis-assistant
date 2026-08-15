@@ -2,6 +2,7 @@ package com.jarvis.assistant.data
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Log
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 
@@ -9,13 +10,14 @@ import androidx.security.crypto.MasterKey
  * Settings repository for JARVIS preferences.
  *
  * Stores:
- * - Gemini API key (encrypted)
- * - Voice profile data (encrypted)
+ * - Gemini API key (encrypted, with fallback to standard prefs)
+ * - Voice profile data (encrypted, with fallback to standard prefs)
  * - User preferences (standard SharedPreferences)
  */
 class SettingsRepository(private val context: Context) {
 
     companion object {
+        private const val TAG = "JarvisSettings"
         private const val PREFS_NAME = "jarvis_settings"
         private const val ENCRYPTED_PREFS_NAME = "jarvis_secure"
 
@@ -53,7 +55,8 @@ class SettingsRepository(private val context: Context) {
                 EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
             )
         } catch (e: Exception) {
-            // Fallback to regular prefs if encryption fails
+            Log.e(TAG, "EncryptedSharedPreferences failed, falling back to standard prefs", e)
+            // Fallback to regular prefs if encryption fails (some OEM devices have KeyStore bugs)
             context.getSharedPreferences(ENCRYPTED_PREFS_NAME, Context.MODE_PRIVATE)
         }
     }
@@ -61,20 +64,44 @@ class SettingsRepository(private val context: Context) {
     // === API Key ===
     var apiKey: String
         get() {
-            val stored = securePrefs.getString(KEY_API_KEY, null)
-            if (stored == null) {
-                // First launch — set the pre-configured key
-                apiKey = DEFAULT_API_KEY
-                return DEFAULT_API_KEY
+            return try {
+                val stored = securePrefs.getString(KEY_API_KEY, null)
+                if (stored == null) {
+                    apiKey = DEFAULT_API_KEY
+                    DEFAULT_API_KEY
+                } else {
+                    stored
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error reading API key", e)
+                DEFAULT_API_KEY
             }
-            return stored
         }
-        set(value) = securePrefs.edit().putString(KEY_API_KEY, value).apply()
+        set(value) {
+            try {
+                securePrefs.edit().putString(KEY_API_KEY, value).apply()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error saving API key", e)
+            }
+        }
 
     // === Voice Profile ===
     var voiceProfile: String?
-        get() = securePrefs.getString(KEY_VOICE_PROFILE, null)
-        set(value) = securePrefs.edit().putString(KEY_VOICE_PROFILE, value).apply()
+        get() {
+            return try {
+                securePrefs.getString(KEY_VOICE_PROFILE, null)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error reading voice profile", e)
+                null
+            }
+        }
+        set(value) {
+            try {
+                securePrefs.edit().putString(KEY_VOICE_PROFILE, value).apply()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error saving voice profile", e)
+            }
+        }
 
     var isVoiceEnrolled: Boolean
         get() = prefs.getBoolean(KEY_VOICE_ENROLLED, false)
@@ -119,7 +146,11 @@ class SettingsRepository(private val context: Context) {
      * Clear all settings and stored data.
      */
     fun clearAll() {
-        prefs.edit().clear().apply()
-        securePrefs.edit().clear().apply()
+        try {
+            prefs.edit().clear().apply()
+            securePrefs.edit().clear().apply()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error clearing settings", e)
+        }
     }
 }
