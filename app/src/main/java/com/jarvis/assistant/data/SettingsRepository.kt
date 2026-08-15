@@ -36,6 +36,28 @@ class SettingsRepository(private val context: Context) {
         const val KEY_FIRST_LAUNCH = "first_launch"
     }
 
+    private val prefs: SharedPreferences by lazy {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    }
+
+    private val securePrefs: SharedPreferences by lazy {
+        try {
+            val masterKey = MasterKey.Builder(context)
+                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                .build()
+            EncryptedSharedPreferences.create(
+                context,
+                ENCRYPTED_PREFS_NAME,
+                masterKey,
+                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+            )
+        } catch (e: Exception) {
+            // Fallback to regular prefs if encryption fails
+            context.getSharedPreferences(ENCRYPTED_PREFS_NAME, Context.MODE_PRIVATE)
+        }
+    }
+
     // === API Key ===
     var apiKey: String
         get() {
