@@ -349,11 +349,6 @@ class JarvisListenerService : Service() {
             }
         }
 
-        // Request battery optimization exemption AFTER everything is running
-        withContext(Dispatchers.Main) {
-            requestBatteryOptimizationExemption()
-        }
-
         // Start audio capture and feed into the pipeline
         val capture = audioCapture
         if (capture == null) {

@@ -26,7 +26,7 @@ class GeminiClient(
     companion object {
         private const val TAG = "JarvisGemini"
         private const val BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-        private val MODELS = listOf("gemini-2.0-flash", "gemini-1.5-flash")
+        private val MODELS = listOf("gemini-2.5-flash", "gemini-flash-latest", "gemini-2.5-flash-lite", "gemini-3.7-flash")
         private const val MAX_RETRIES = 2
     }
 
