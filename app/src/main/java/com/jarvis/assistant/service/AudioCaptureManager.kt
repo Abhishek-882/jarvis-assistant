@@ -5,6 +5,8 @@ import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.NoiseSuppressor
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import android.content.Context
@@ -19,6 +21,8 @@ import kotlinx.coroutines.flow.StateFlow
  * into the wake word detector and speech recognizer.
  *
  * Features:
+ * - Hardware Acoustic Echo Cancellation (AEC)
+ * - Hardware Noise Suppression (NS)
  * - Audio focus management
  * - Interruption handling (phone calls, media)
  * - Buffer management for real-time processing
@@ -34,6 +38,8 @@ class AudioCaptureManager(private val context: Context) {
     }
 
     private var audioRecord: AudioRecord? = null
+    private var echoCanceler: AcousticEchoCanceler? = null
+    private var noiseSuppressor: NoiseSuppressor? = null
     private var isCapturing = false
     private var captureJob: Job? = null
 
@@ -70,7 +76,7 @@ class AudioCaptureManager(private val context: Context) {
 
         try {
             audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                 SAMPLE_RATE,
                 CHANNEL_CONFIG,
                 AUDIO_FORMAT,
@@ -78,10 +84,45 @@ class AudioCaptureManager(private val context: Context) {
             )
 
             if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                Log.w(TAG, "VOICE_COMMUNICATION source failed, falling back to VOICE_RECOGNITION")
+                audioRecord?.release()
+                audioRecord = AudioRecord(
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                    SAMPLE_RATE,
+                    CHANNEL_CONFIG,
+                    AUDIO_FORMAT,
+                    bufferSize
+                )
+            }
+
+            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
                 Log.e(TAG, "AudioRecord failed to initialize")
                 audioRecord?.release()
                 audioRecord = null
                 return false
+            }
+
+            // Enable Hardware Acoustic Echo Cancellation & Noise Suppression if supported
+            val sessionId = audioRecord?.audioSessionId ?: 0
+            if (sessionId != 0) {
+                if (AcousticEchoCanceler.isAvailable()) {
+                    try {
+                        echoCanceler = AcousticEchoCanceler.create(sessionId)
+                        echoCanceler?.enabled = true
+                        Log.i(TAG, "Hardware AcousticEchoCanceler enabled on session $sessionId")
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to enable AcousticEchoCanceler", e)
+                    }
+                }
+                if (NoiseSuppressor.isAvailable()) {
+                    try {
+                        noiseSuppressor = NoiseSuppressor.create(sessionId)
+                        noiseSuppressor?.enabled = true
+                        Log.i(TAG, "Hardware NoiseSuppressor enabled on session $sessionId")
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to enable NoiseSuppressor", e)
+                    }
+                }
             }
 
             audioRecord?.startRecording()
@@ -133,6 +174,10 @@ class AudioCaptureManager(private val context: Context) {
         captureJob = null
 
         try {
+            echoCanceler?.release()
+            echoCanceler = null
+            noiseSuppressor?.release()
+            noiseSuppressor = null
             audioRecord?.stop()
             audioRecord?.release()
         } catch (e: Exception) {

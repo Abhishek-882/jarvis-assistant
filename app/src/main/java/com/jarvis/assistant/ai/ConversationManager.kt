@@ -24,7 +24,12 @@ class ConversationManager(
      * Add a user message to the conversation.
      */
     fun addUserMessage(text: String) {
-        _history.add(ConversationMessage(role = "user", text = text))
+        if (text.isBlank()) return
+        if (_history.isNotEmpty() && _history.last().role == "user") {
+            _history[_history.lastIndex] = ConversationMessage(role = "user", text = text)
+        } else {
+            _history.add(ConversationMessage(role = "user", text = text))
+        }
         trimHistory()
     }
 
@@ -32,7 +37,12 @@ class ConversationManager(
      * Add JARVIS's response to the conversation.
      */
     fun addAssistantMessage(text: String) {
-        _history.add(ConversationMessage(role = "model", text = text))
+        if (text.isBlank()) return
+        if (_history.isNotEmpty() && _history.last().role == "model") {
+            _history[_history.lastIndex] = ConversationMessage(role = "model", text = text)
+        } else {
+            _history.add(ConversationMessage(role = "model", text = text))
+        }
         trimHistory()
     }
 

@@ -378,11 +378,41 @@ class JarvisListenerService : Service() {
         }
     }
 
+    private var lastConfiguredApiKey: String = ""
+
+    /**
+     * Get or dynamically update the GeminiClient from SettingsRepository.
+     */
+    private fun getOrUpdateGeminiClient(): GeminiClient? {
+        try {
+            val settings = SettingsRepository(this@JarvisListenerService)
+            val currentKey = settings.apiKey.trim()
+            if (currentKey.isBlank()) {
+                geminiClient = null
+                return null
+            }
+            if (geminiClient == null || lastConfiguredApiKey != currentKey) {
+                lastConfiguredApiKey = currentKey
+                geminiClient = GeminiClient(currentKey)
+                Log.i(TAG, "Gemini client updated with key (length: ${currentKey.length})")
+            }
+            return geminiClient
+        } catch (e: Exception) {
+            Log.e(TAG, "Error resolving Gemini client", e)
+            return null
+        }
+    }
+
     /**
      * Process incoming audio data through the pipeline.
      */
     private fun processAudio(buffer: ByteArray, size: Int) {
         try {
+            // Mute / drop audio while JARVIS is speaking or during echo cooldown window
+            if (ttsManager?.isSpeakingOrCoolingDown() == true) {
+                return
+            }
+
             if (isListeningForCommand) {
                 processCommandAudio(buffer, size)
             } else {
@@ -422,18 +452,23 @@ class JarvisListenerService : Service() {
      * Handle wake word activation — transition to command listening mode.
      */
     private fun onWakeWordActivated() {
-        isListeningForCommand = true
-        commandAudioBuffer.clear()
-        silenceCounter = 0
+        serviceScope.launch {
+            _serviceState.value = JarvisServiceState.SPEAKING
+            updateNotification("JARVIS: Yes, Sir?")
 
-        _serviceState.value = JarvisServiceState.LISTENING
-        updateNotification("JARVIS is listening to you...")
+            // Speak acknowledgment and wait for speech to finish completely
+            ttsManager?.speakAndWait("Yes, Sir?")
+            delay(350) // Post-speech pause to guarantee no speaker echo in mic buffer
 
-        // Reset the command recognizer for a fresh utterance
-        speechRecognizer?.resetCommandRecognizer()
-
-        // Play a subtle acknowledgment
-        ttsManager?.speak("Yes, Sir?")
+            // Now reset the recognizer and start listening for the user's command
+            speechRecognizer?.resetCommandRecognizer()
+            commandAudioBuffer.clear()
+            silenceCounter = 0
+            _lastTranscription.value = ""
+            isListeningForCommand = true
+            _serviceState.value = JarvisServiceState.LISTENING
+            updateNotification("JARVIS is listening to you...")
+        }
     }
 
     /**
@@ -486,17 +521,8 @@ class JarvisListenerService : Service() {
 
         serviceScope.launch {
             try {
-                // First, try offline command parsing
-                val offlineAction = CommandParser.parseOfflineCommand(command)
+                val client = getOrUpdateGeminiClient()
 
-                if (offlineAction != null && geminiClient == null) {
-                    val response = "Right away, Sir."
-                    respondAndExecute(response, offlineAction)
-                    return@launch
-                }
-
-                // Use Gemini AI for intelligent response
-                val client = geminiClient
                 if (client != null) {
                     conversationManager?.addUserMessage(command)
 
@@ -509,22 +535,37 @@ class JarvisListenerService : Service() {
                             respondAndExecute(parsed.spokenText, parsed.action)
                         },
                         onFailure = { error ->
+                            Log.e(TAG, "Gemini API error: ${error.message}", error)
                             val offlineFallback = CommandParser.parseOfflineCommand(command)
                             if (offlineFallback != null) {
-                                val response = "I'm having trouble connecting, but I can handle that locally, Sir."
+                                val response = "I'm having trouble connecting to AI, but executing offline, Sir."
                                 respondAndExecute(response, offlineFallback)
                             } else {
-                                val errorResponse = "I apologize, Sir. I'm unable to process that request at the moment."
-                                respondWithSpeech(errorResponse)
+                                val errorMsg = error.message ?: ""
+                                val userFeedback = when {
+                                    errorMsg.contains("API key", ignoreCase = true) || errorMsg.contains("API_KEY", ignoreCase = true) ->
+                                        "Your Gemini API key appears to be invalid, Sir. Please check your key in Settings."
+                                    errorMsg.contains("Rate limit", ignoreCase = true) || errorMsg.contains("429") ->
+                                        "We have reached the API rate limit, Sir. Please try again shortly."
+                                    errorMsg.contains("Unable to resolve host", ignoreCase = true) ||
+                                    errorMsg.contains("Failed to connect", ignoreCase = true) ||
+                                    errorMsg.contains("timeout", ignoreCase = true) ->
+                                        "I cannot connect to the internet right now, Sir. Please check your network."
+                                    else ->
+                                        "I apologize, Sir. I was unable to process that ($errorMsg)."
+                                }
+                                respondWithSpeech(userFeedback)
                             }
                         }
                     )
                 } else {
+                    // No API key configured
+                    val offlineAction = CommandParser.parseOfflineCommand(command)
                     if (offlineAction != null) {
                         val response = "Executing, Sir."
                         respondAndExecute(response, offlineAction)
                     } else {
-                        respondWithSpeech("I need an API key to answer that, Sir. Please configure one in the settings.")
+                        respondWithSpeech("Please configure your Gemini API key in Settings, Sir, so I can converse with you.")
                     }
                 }
             } catch (e: Exception) {
@@ -544,6 +585,7 @@ class JarvisListenerService : Service() {
         onMessageReceived?.invoke(speechText, false)
 
         ttsManager?.speakAndWait(speechText)
+        delay(350) // Post-speech pause to guarantee no speaker echo
 
         // Execute the action after speaking
         action?.let {
@@ -554,7 +596,7 @@ class JarvisListenerService : Service() {
             }
         }
 
-        // Return to idle
+        speechRecognizer?.resetCommandRecognizer()
         _serviceState.value = JarvisServiceState.IDLE
         updateNotification("JARVIS is standing by...")
     }
@@ -569,7 +611,9 @@ class JarvisListenerService : Service() {
         onMessageReceived?.invoke(text, false)
 
         ttsManager?.speakAndWait(text)
+        delay(350) // Post-speech pause
 
+        speechRecognizer?.resetCommandRecognizer()
         _serviceState.value = JarvisServiceState.IDLE
         updateNotification("JARVIS is standing by...")
     }

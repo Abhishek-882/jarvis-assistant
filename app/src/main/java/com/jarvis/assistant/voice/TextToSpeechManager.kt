@@ -27,6 +27,8 @@ class TextToSpeechManager(
     private var tts: TextToSpeech? = null
     private var isInitialized = false
     private var onInitCallback: (() -> Unit)? = null
+    private var isSpeakingInternal = false
+    private var lastSpeechEndTime = 0L
 
     // JARVIS voice settings
     var pitch: Float = 0.9f        // Slightly lower pitch
@@ -81,25 +83,33 @@ class TextToSpeechManager(
             return
         }
 
+        isSpeakingInternal = true
         val utteranceId = "jarvis_${System.currentTimeMillis()}"
 
         tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
+                isSpeakingInternal = true
                 Log.d(TAG, "JARVIS speaking: $text")
             }
 
             override fun onDone(utteranceId: String?) {
+                isSpeakingInternal = false
+                lastSpeechEndTime = System.currentTimeMillis()
                 Log.d(TAG, "JARVIS finished speaking")
                 onComplete?.invoke()
             }
 
             @Deprecated("Deprecated in Java")
             override fun onError(utteranceId: String?) {
+                isSpeakingInternal = false
+                lastSpeechEndTime = System.currentTimeMillis()
                 Log.e(TAG, "JARVIS TTS error for: $text")
                 onComplete?.invoke()
             }
 
             override fun onError(utteranceId: String?, errorCode: Int) {
+                isSpeakingInternal = false
+                lastSpeechEndTime = System.currentTimeMillis()
                 Log.e(TAG, "JARVIS TTS error code $errorCode for: $text")
                 onComplete?.invoke()
             }
@@ -132,6 +142,8 @@ class TextToSpeechManager(
      * Stop any ongoing speech (for barge-in support).
      */
     fun stop() {
+        isSpeakingInternal = false
+        lastSpeechEndTime = System.currentTimeMillis()
         tts?.stop()
     }
 
@@ -139,7 +151,16 @@ class TextToSpeechManager(
      * Check if JARVIS is currently speaking.
      */
     val isSpeaking: Boolean
-        get() = tts?.isSpeaking == true
+        get() = isSpeakingInternal || (tts?.isSpeaking == true)
+
+    /**
+     * Check if JARVIS is currently speaking or in post-speech echo cooldown window.
+     * Prevents microphone from capturing speaker output and reverberation.
+     */
+    fun isSpeakingOrCoolingDown(cooldownMs: Long = 600L): Boolean {
+        if (isSpeaking) return true
+        return (System.currentTimeMillis() - lastSpeechEndTime) < cooldownMs
+    }
 
     /**
      * Update voice parameters.
@@ -159,6 +180,7 @@ class TextToSpeechManager(
      * Release TTS resources.
      */
     fun shutdown() {
+        isSpeakingInternal = false
         tts?.stop()
         tts?.shutdown()
         tts = null

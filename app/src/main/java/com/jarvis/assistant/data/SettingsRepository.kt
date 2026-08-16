@@ -65,23 +65,34 @@ class SettingsRepository(private val context: Context) {
     var apiKey: String
         get() {
             return try {
-                val stored = securePrefs.getString(KEY_API_KEY, null)
-                if (stored == null) {
-                    apiKey = DEFAULT_API_KEY
+                val secureVal = securePrefs.getString(KEY_API_KEY, null)
+                val standardVal = prefs.getString(KEY_API_KEY, null)
+                val stored = secureVal ?: standardVal
+                if (stored.isNullOrBlank()) {
                     DEFAULT_API_KEY
                 } else {
-                    stored
+                    stored.trim()
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error reading API key", e)
-                DEFAULT_API_KEY
+                try {
+                    prefs.getString(KEY_API_KEY, DEFAULT_API_KEY)?.trim() ?: DEFAULT_API_KEY
+                } catch (e2: Exception) {
+                    DEFAULT_API_KEY
+                }
             }
         }
         set(value) {
+            val trimmed = value.trim()
             try {
-                securePrefs.edit().putString(KEY_API_KEY, value).apply()
+                securePrefs.edit().putString(KEY_API_KEY, trimmed).apply()
             } catch (e: Exception) {
-                Log.e(TAG, "Error saving API key", e)
+                Log.e(TAG, "Error saving API key to securePrefs", e)
+            }
+            try {
+                prefs.edit().putString(KEY_API_KEY, trimmed).apply()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error saving API key to standard prefs", e)
             }
         }
 
