@@ -510,6 +510,24 @@ class JarvisListenerService : Service() {
      * Handle a received voice command.
      */
     private fun onCommandReceived(command: String) {
+        val lower = command.lowercase().trim()
+
+        // 1. Direct Voice Control Interceptions
+        if (lower == "stop" || lower == "stop talking" || lower == "quiet" || lower == "shut up" || lower == "cancel") {
+            ttsManager?.stop()
+            speechRecognizer?.resetCommandRecognizer()
+            _serviceState.value = JarvisServiceState.IDLE
+            updateNotification("JARVIS is standing by...")
+            return
+        }
+
+        if (lower == "pause" || lower == "stand down" || lower == "sleep" || lower == "stop listening") {
+            serviceScope.launch {
+                respondWithSpeech("Standing down, Sir. Say Jarvis whenever you need me.")
+            }
+            return
+        }
+
         _serviceState.value = JarvisServiceState.THINKING
         updateNotification("JARVIS is processing...")
         onMessageReceived?.invoke(command, true)
